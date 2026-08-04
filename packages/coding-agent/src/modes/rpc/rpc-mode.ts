@@ -29,6 +29,7 @@ import { killTrackedDetachedChildren } from "../../utils/shell.ts";
 import { type Theme, theme } from "../interactive/theme/theme.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
 import type {
+	RpcArgumentCompletion,
 	RpcCommand,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
@@ -705,6 +706,20 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 				}
 
 				return success(id, "get_commands", { commands });
+			}
+
+			case "get_argument_completions": {
+				const resolved = session.extensionRunner.getCommand(command.commandName);
+				if (!resolved?.getArgumentCompletions) {
+					return success(id, "get_argument_completions", { items: [] });
+				}
+				const completions = await resolved.getArgumentCompletions(command.argumentPrefix ?? "");
+				const items: RpcArgumentCompletion[] = (completions ?? []).map((item) => ({
+					value: item.value,
+					label: item.label,
+					...(item.description ? { description: item.description } : {}),
+				}));
+				return success(id, "get_argument_completions", { items });
 			}
 
 			default: {
