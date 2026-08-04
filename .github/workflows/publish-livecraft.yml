@@ -84,11 +84,19 @@ jobs:
         run: npm run build -w @fan92rus/pi-coding-agent
 
       - name: Bump prerelease version
+        # Bump via node directly: npm version in a workspace triggers a
+        # background npm install that re-resolves unpublished sibling
+        # packages (@earendil-works/pi-client, pi-protocol) and 404s.
         run: |
-          cd packages/coding-agent
-          npm version prerelease --preid=livecraft --no-git-tag-version
-          cd ../..
-          git add packages/coding-agent/package.json package-lock.json
+          node -e "
+            const fs = require('fs');
+            const p = 'packages/coding-agent/package.json';
+            const j = JSON.parse(fs.readFileSync(p, 'utf8'));
+            const [major, minor, patch] = j.version.split('-')[0].split('.').map(Number);
+            j.version = major + '.' + minor + '.' + (patch + 1) + '-livecraft.0';
+            fs.writeFileSync(p, JSON.stringify(j, null, '\t') + '\n');
+          "
+          git add packages/coding-agent/package.json
           git -c user.name="livecraft-bot" -c user.email="livecraft-bot@users.noreply.github.com" \
             commit -m "chore: bump to $(node -p "require('./packages/coding-agent/package.json').version")" || true
 
