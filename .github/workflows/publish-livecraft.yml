@@ -31,21 +31,31 @@ jobs:
           ref: livecraft
           fetch-depth: 0
 
-      - name: Sync with upstream
+      - name: Sync with upstream release tag
+        # Rebase the fork layer onto the latest upstream release tag (e.g. v0.83.1).
+        # We intentionally track release tags, not main: only tagged releases ship
+        # sibling packages to npm, so building the fork against newer main would
+        # fail with 404 on unpublished dependencies.
         run: |
           git config user.name "livecraft-bot"
           git config user.email "livecraft-bot@users.noreply.github.com"
           git remote add upstream https://github.com/earendil-works/pi.git
-          git fetch upstream main
-          if git merge --no-edit upstream/main 2>&1 | grep -q "CONFLICT"; then
-            echo "::error::Merge with upstream/main conflicted. Resolve manually on the livecraft branch."
+          git fetch upstream --tags
+          LATEST_TAG=$(git tag --list 'v*' --sort=-v:refname | head -1)
+          echo "Latest upstream release tag: $LATEST_TAG"
+          if [ -z "$LATEST_TAG" ]; then
+            echo "::error::No upstream release tags found."
             exit 1
           fi
-          if ! git diff --quiet upstream/main; then
-            echo "Merged upstream/main into livecraft."
-            git push origin livecraft
+          if git merge-base --is-ancestor "$LATEST_TAG" HEAD; then
+            echo "Livecraft already contains $LATEST_TAG."
           else
-            echo "Livecraft is up to date with upstream."
+            if git merge --no-edit "$LATEST_TAG" 2>&1 | grep -q "CONFLICT"; then
+              echo "::error::Merge with $LATEST_TAG conflicted. Resolve manually on the livecraft branch."
+              exit 1
+            fi
+            echo "Merged $LATEST_TAG into livecraft."
+            git push origin livecraft
           fi
 
       - name: Setup Node.js
