@@ -1,0 +1,87 @@
+name: Publish Livecraft
+
+# Rebuilds and republishes the livecraft fork layer on top of the latest
+# upstream main, then publishes @fan92rus/pi-coding-agent under the
+# 'livecraft' dist-tag. Runs nightly and on every push to the livecraft
+# branch, and can be triggered manually.
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+  push:
+    branches:
+      - livecraft
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-livecraft
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # Do not re-run on commits made by this workflow itself (bump + upstream sync).
+    if: github.event_name != 'push' || github.event.head_commit.author.name != 'livecraft-bot'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: livecraft
+          fetch-depth: 0
+
+      - name: Sync with upstream
+        run: |
+          git config user.name "livecraft-bot"
+          git config user.email "livecraft-bot@users.noreply.github.com"
+          git remote add upstream https://github.com/earendil-works/pi.git
+          git fetch upstream main
+          if git merge --no-edit upstream/main 2>&1 | grep -q "CONFLICT"; then
+            echo "::error::Merge with upstream/main conflicted. Resolve manually on the livecraft branch."
+            exit 1
+          fi
+          if ! git diff --quiet upstream/main; then
+            echo "Merged upstream/main into livecraft."
+            git push origin livecraft
+          else
+            echo "Livecraft is up to date with upstream."
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build dependencies of coding-agent
+        # Only the packages coding-agent imports at runtime: tui, ai, agent.
+        run: |
+          npm run build -w @earendil-works/pi-tui
+          npm run build -w @earendil-works/pi-ai
+          npm run build -w @earendil-works/pi-agent-core
+
+      - name: Build coding-agent
+        run: npm run build -w @fan92rus/pi-coding-agent
+
+      - name: Bump prerelease version
+        run: |
+          cd packages/coding-agent
+          npm version prerelease --preid=livecraft --no-git-tag-version
+          cd ../..
+          git add packages/coding-agent/package.json package-lock.json
+          git -c user.name="livecraft-bot" -c user.email="livecraft-bot@users.noreply.github.com" \
+            commit -m "chore: bump to $(node -p "require('./packages/coding-agent/package.json').version")" || true
+
+      - name: Publish to npm
+        working-directory: packages/coding-agent
+        run: npm publish --access public --tag livecraft --ignore-scripts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Push bump commit
+        run: git push origin livecraft || true
