@@ -87,14 +87,33 @@ jobs:
         # Bump via node directly: npm version in a workspace triggers a
         # background npm install that re-resolves unpublished sibling
         # packages (@earendil-works/pi-client, pi-protocol) and 404s.
+        # The patch is bumped from the CURRENT package version, and the
+        # livecraft pre-release number is incremented until the version
+        # is not yet published, so CI never collides with manual runs.
         run: |
           node -e "
             const fs = require('fs');
             const p = 'packages/coding-agent/package.json';
             const j = JSON.parse(fs.readFileSync(p, 'utf8'));
-            const [major, minor, patch] = j.version.split('-')[0].split('.').map(Number);
-            j.version = major + '.' + minor + '.' + (patch + 1) + '-livecraft.0';
+            const base = j.version.split('-')[0]; // e.g. 0.83.0
+            const [major, minor, patch] = base.split('.').map(Number);
+            let next = major + '.' + minor + '.' + (patch + 1) + '-livecraft.0';
+            j.version = next;
             fs.writeFileSync(p, JSON.stringify(j, null, '\t') + '\n');
+            console.log('bumped to', j.version);
+          "
+          # ensure the version is not already published: increment livecraft.N until free
+          node -e "
+            const { execSync } = require('child_process');
+            const fs = require('fs');
+            const p = 'packages/coding-agent/package.json';
+            const j = JSON.parse(fs.readFileSync(p, 'utf8'));
+            let v = j.version;
+            for (let n = 0; ; n++) {
+              const candidate = v.split('-')[0] + '-livecraft.' + n;
+              try { execSync('npm view @fan92rus/pi-coding-agent@' + candidate + ' version', { stdio: 'pipe' }); }
+              catch { j.version = candidate; fs.writeFileSync(p, JSON.stringify(j, null, '\t') + '\n'); console.log('final', j.version); break; }
+            }
           "
           git add packages/coding-agent/package.json
           git -c user.name="livecraft-bot" -c user.email="livecraft-bot@users.noreply.github.com" \
