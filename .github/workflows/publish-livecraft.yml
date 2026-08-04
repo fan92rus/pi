@@ -117,7 +117,7 @@ jobs:
           "
           git add packages/coding-agent/package.json
           git -c user.name="livecraft-bot" -c user.email="livecraft-bot@users.noreply.github.com" \
-            commit -m "chore: bump to $(node -p "require('./packages/coding-agent/package.json').version")" || true
+            commit --no-verify -m "chore: bump to $(node -p "require('./packages/coding-agent/package.json').version")" || true
 
       - name: Publish to npm
         working-directory: packages/coding-agent
