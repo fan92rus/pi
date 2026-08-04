@@ -1,7 +1,6 @@
 {
-	"name": "@earendil-works/pi-coding-agent",
-	"version": "0.83.0",
-	"description": "Coding agent CLI with read, bash, edit, write tools and session management",
+	"name": "@fan92rus/pi-coding-agent",
+	"version": "0.83.1-livecraft.1",
 	"type": "module",
 	"piConfig": {
 		"configDir": ".pi"
@@ -25,8 +24,7 @@
 		"docs",
 		"examples",
 		"containerization.md",
-		"CHANGELOG.md",
-		"npm-shrinkwrap.json"
+		"CHANGELOG.md"
 	],
 	"scripts": {
 		"clean": "shx rm -rf dist",
@@ -36,7 +34,7 @@
 		"copy-binary-assets": "shx cp package.json dist/ && shx cp README.md dist/ && shx cp CHANGELOG.md dist/ && shx mkdir -p dist/theme && shx cp src/modes/interactive/theme/*.json dist/theme/ && shx mkdir -p dist/assets && shx cp src/modes/interactive/assets/*.png dist/assets/ && shx mkdir -p dist/export-html/vendor && shx cp src/core/export-html/template.html dist/export-html/ && shx cp src/core/export-html/vendor/*.js dist/export-html/vendor/ && shx cp -r docs dist/ && shx cp -r examples dist/ && shx cp ../../node_modules/@silvia-odwyer/photon-node/photon_rs_bg.wasm dist/",
 		"test": "vitest --run",
 		"shrinkwrap": "node ../../scripts/generate-coding-agent-shrinkwrap.mjs",
-		"prepublishOnly": "npm run clean && npm run build && npm run shrinkwrap"
+		"prepublishOnly": "npm run clean && npm run build"
 	},
 	"dependencies": {
 		"@earendil-works/pi-agent-core": "^0.83.0",
