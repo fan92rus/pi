@@ -1,12 +1,12 @@
 {
 	"name": "@fan92rus/pi-coding-agent",
-	"version": "0.83.0",
+	"version": "0.83.1-livecraft.6",
 	"lockfileVersion": 3,
 	"requires": true,
 	"packages": {
 		"": {
 			"name": "@fan92rus/pi-coding-agent",
-			"version": "0.83.0",
+			"version": "0.83.1-livecraft.6",
 			"license": "MIT",
 			"dependencies": {
 				"@earendil-works/pi-agent-core": "^0.83.0",
