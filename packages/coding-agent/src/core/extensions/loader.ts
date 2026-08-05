@@ -83,7 +83,11 @@ function getAliases(): Record<string, string> {
 	if (_aliases) return _aliases;
 
 	const __dirname = path.dirname(fileURLToPath(import.meta.url));
-	const packageIndex = path.resolve(__dirname, "../..", "index.js");
+	// Alias @earendil-works/pi-coding-agent to the compat entry (a re-export of
+	// this fork's real API) so resolution (import.meta.resolve / findPackageJSON)
+	// lands on a package.json whose name matches the original package. Extensions
+	// keep importing the original specifier and get the same API.
+	const piCodingAgentCompatEntry = path.resolve(__dirname, "../../../compat/index.js");
 
 	const typeboxEntry = require.resolve("typebox");
 	const typeboxCompileEntry = require.resolve("typebox/compile");
@@ -98,7 +102,7 @@ function getAliases(): Record<string, string> {
 		return fileURLToPath(import.meta.resolve(specifier));
 	};
 
-	const piCodingAgentEntry = packageIndex;
+	const piCodingAgentEntry = piCodingAgentCompatEntry;
 	const piAgentCoreEntry = resolveWorkspaceOrImport("agent/dist/index.js", "@earendil-works/pi-agent-core");
 	const piTuiEntry = resolveWorkspaceOrImport("tui/dist/index.js", "@earendil-works/pi-tui");
 	// Extensions resolve the pi-ai root to the compat entrypoint (a strict

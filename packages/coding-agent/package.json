@@ -21,6 +21,7 @@
 	},
 	"files": [
 		"dist",
+		"compat",
 		"docs",
 		"examples",
 		"containerization.md",

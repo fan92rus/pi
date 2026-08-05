@@ -1,0 +1,8 @@
+{
+	"name": "@earendil-works/pi-coding-agent",
+	"type": "module",
+	"main": "./index.js",
+	"bin": {
+		"pi": "cli.js"
+	}
+}
