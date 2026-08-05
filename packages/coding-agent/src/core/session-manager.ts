@@ -8,8 +8,8 @@ import {
 	existsSync,
 	mkdirSync,
 	openSync,
-	readFileSync,
 	readdirSync,
+	readFileSync,
 	readSync,
 	renameSync,
 	statSync,
@@ -133,9 +133,7 @@ function sessionInfoFromHeader(
 ): SessionInfo | null {
 	const header = readSessionHeaderForDiscovery(filePath);
 	if (!header) return null;
-	const created = Number.isNaN(new Date(header.timestamp).getTime())
-		? stats.mtime
-		: new Date(header.timestamp);
+	const created = Number.isNaN(new Date(header.timestamp).getTime()) ? stats.mtime : new Date(header.timestamp);
 	return {
 		path: filePath,
 		id: header.id,
@@ -1854,10 +1852,7 @@ export class SessionManager {
 	 * List all sessions across all project directories.
 	 * @param onProgress Optional callback for progress updates (loaded, total)
 	 */
-	static async listAll(
-		onProgress?: SessionListProgress,
-		options?: SessionListOptions,
-	): Promise<SessionInfo[]>;
+	static async listAll(onProgress?: SessionListProgress, options?: SessionListOptions): Promise<SessionInfo[]>;
 	static async listAll(
 		sessionDir?: string,
 		onProgress?: SessionListProgress,
@@ -1871,12 +1866,15 @@ export class SessionManager {
 		const customSessionDir =
 			typeof sessionDirOrOnProgress === "string" ? normalizePath(sessionDirOrOnProgress) : undefined;
 		const progress =
-			typeof sessionDirOrOnProgress === "function" ? sessionDirOrOnProgress
-			: typeof onProgressOrOptions === "function" ? onProgressOrOptions
-			: undefined;
+			typeof sessionDirOrOnProgress === "function"
+				? sessionDirOrOnProgress
+				: typeof onProgressOrOptions === "function"
+					? onProgressOrOptions
+					: undefined;
 		const options =
-			typeof onProgressOrOptions === "object" && onProgressOrOptions !== null ? onProgressOrOptions
-			: maybeOptions ?? {};
+			typeof onProgressOrOptions === "object" && onProgressOrOptions !== null
+				? onProgressOrOptions
+				: (maybeOptions ?? {});
 		if (customSessionDir) {
 			const sessions = await listSessionsFromDir(customSessionDir, progress, options);
 			sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
