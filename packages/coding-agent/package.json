@@ -1,6 +1,6 @@
 {
 	"name": "@fan92rus/pi-coding-agent",
-	"version": "0.83.0",
+	"version": "0.83.1-livecraft.5",
 	"type": "module",
 	"piConfig": {
 		"configDir": ".pi"
