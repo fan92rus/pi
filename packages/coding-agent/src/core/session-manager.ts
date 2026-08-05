@@ -13,6 +13,7 @@ import {
 	readSync,
 	renameSync,
 	statSync,
+	unlinkSync,
 	writeFileSync,
 } from "fs";
 import { readdir, stat } from "fs/promises";
@@ -87,7 +88,15 @@ function saveSessionIndex(dir: string, index: SessionIndexFile): void {
 		try {
 			renameSync(tmp, target);
 		} catch {
-			// Cross-process rename races: keep the temp file, it still helps next read.
+			// Cross-process rename race: another process already wrote the
+			// target. The temp file can never be read back (loadSessionIndex
+			// only reads the target), so remove it instead of leaving an
+			// orphaned .tmp file behind.
+			try {
+				unlinkSync(tmp);
+			} catch {
+				// Best-effort cleanup; ignore.
+			}
 		}
 	} catch {
 		// Ignore: index is best-effort.
@@ -802,7 +811,8 @@ function getMessageActivityTime(entry: SessionMessageEntry): number | undefined 
 	return Number.isNaN(t) ? undefined : t;
 }
 
-async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
+async function buildSessionInfo(filePath: string, options?: { includeContent?: boolean }): Promise<SessionInfo | null> {
+	const includeContent = options?.includeContent ?? true;
 	try {
 		const stats = await stat(filePath);
 		let header: SessionHeader | null = null;
@@ -847,7 +857,9 @@ async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
 			const textContent = extractTextContent(message);
 			if (!textContent) continue;
 
-			allMessages.push(textContent);
+			if (includeContent) {
+				allMessages.push(textContent);
+			}
 			if (!firstMessage && message.role === "user") {
 				firstMessage = textContent;
 			}
@@ -875,7 +887,7 @@ async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
 			modified,
 			messageCount,
 			firstMessage: firstMessage || "(no messages)",
-			allMessagesText: allMessages.join(" "),
+			allMessagesText: includeContent ? allMessages.join(" ") : "",
 		};
 	} catch {
 		return null;
@@ -1003,19 +1015,17 @@ async function listSessionsFromDir(
 				continue;
 			}
 
-			// New or changed file: fast header read first, full read only as fallback.
-			const headerInfo = sessionInfoFromHeader(file, stats);
-			if (headerInfo) {
-				sessions.push(headerInfo);
-				index.sessions[filename] = sessionIndexEntryFromInfo(headerInfo, stats.mtimeMs, stats.size);
+			// New or changed file: fully read it so the index gets accurate
+			// metadata (modified = last message time, messageCount, name,
+			// firstMessage) instead of degraded header-only values.
+			const info = await buildSessionInfo(file, { includeContent: false });
+			if (info) {
+				sessions.push(info);
+				index.sessions[filename] = sessionIndexEntryFromInfo(info, stats.mtimeMs, stats.size);
 				indexDirty = true;
 			} else {
-				const info = await buildSessionInfo(file);
-				if (info) {
-					sessions.push(info);
-					index.sessions[filename] = sessionIndexEntryFromInfo(info, stats.mtimeMs, stats.size);
-					indexDirty = true;
-				}
+				const headerInfo = sessionInfoFromHeader(file, stats);
+				if (headerInfo) sessions.push(headerInfo);
 			}
 			loaded++;
 			onProgress?.(progressOffset + loaded, total);
@@ -1892,9 +1902,24 @@ export class SessionManager {
 
 			if (!options.includeContent) {
 				// Fast path: per-directory sidecar index with mtime validation.
+				// Count total session files first so progress is reported globally
+				// across all project directories, not per-directory.
 				const sessions: SessionInfo[] = [];
+				const dirFileCounts: number[] = [];
+				let totalFiles = 0;
 				for (const dir of dirs) {
-					sessions.push(...(await listSessionsFromDir(dir, progress, options)));
+					try {
+						const count = (await readdir(dir)).filter((f) => f.endsWith(".jsonl")).length;
+						dirFileCounts.push(count);
+						totalFiles += count;
+					} catch {
+						dirFileCounts.push(0);
+					}
+				}
+				let progressOffset = 0;
+				for (let i = 0; i < dirs.length; i++) {
+					sessions.push(...(await listSessionsFromDir(dirs[i], progress, options, progressOffset, totalFiles)));
+					progressOffset += dirFileCounts[i];
 				}
 				sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
 				return sessions;

@@ -127,8 +127,13 @@ jobs:
             const sw = JSON.parse(fs.readFileSync(swPath, 'utf8'));
             if (sw.packages && sw.packages['']) {
               sw.packages[''].version = j.version;
-              fs.writeFileSync(swPath, JSON.stringify(sw, null, '\t') + '\n');
             }
+            // Keep the top-level version field in sync with the package version
+            // (npm-shrinkwrap.json has both a top-level version and a
+            // packages[""] entry; leaving the top-level stale breaks the
+            // check:shrinkwrap consistency test).
+            sw.version = j.version;
+            fs.writeFileSync(swPath, JSON.stringify(sw, null, '\t') + '\n');
           "
           git add packages/coding-agent/package.json package-lock.json packages/coding-agent/npm-shrinkwrap.json
           git -c user.name="livecraft-bot" -c user.email="livecraft-bot@users.noreply.github.com" \

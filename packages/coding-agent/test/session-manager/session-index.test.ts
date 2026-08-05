@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -94,6 +94,34 @@ describe("session sidecar index", () => {
 		const full = await SessionManager.list(tempDir, tempDir, undefined, { includeContent: true });
 		expect(full[0]?.allMessagesText).toContain("needle phrase");
 		expect(full.map((s) => s.path)).toEqual([sessionFile]);
+	});
+
+	it("fast path caches complete metadata (messageCount, modified) in the index", async () => {
+		createPersistedSession(tempDir, "hello");
+
+		// Fast-path listing (default options, no includeContent).
+		await SessionManager.list(tempDir, tempDir);
+
+		const index = JSON.parse(readFileSync(join(tempDir, SESSION_INDEX_FILENAME), "utf8"));
+		const entry = Object.values(index.sessions)[0] as { messageCount?: number; modified?: string };
+		// The session has one user + one assistant message. The index must not
+		// cache degraded metadata (messageCount 0) for a new file.
+		expect(entry.messageCount).toBe(2);
+		expect(typeof entry.modified).toBe("string");
+		expect(entry.modified).not.toBe("");
+	});
+
+	it("removes orphaned temp index file when the atomic rename fails", async () => {
+		createPersistedSession(tempDir, "hello");
+
+		// Occupy the index path with a directory so renameSync(tmp, target)
+		// fails (EISDIR/EPERM), simulating a cross-process rename race.
+		mkdirSync(join(tempDir, SESSION_INDEX_FILENAME));
+
+		await SessionManager.list(tempDir, tempDir);
+
+		const leftovers = readdirSync(tempDir).filter((f) => f.endsWith(".tmp"));
+		expect(leftovers).toEqual([]);
 	});
 
 	it("invalidates index when a session file changes", async () => {
