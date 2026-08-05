@@ -4783,11 +4783,13 @@ export class InteractiveMode {
 		this.showSelector((done) => {
 			const selector = new SessionSelectorComponent(
 				(onProgress) =>
-					SessionManager.list(this.sessionManager.getCwd(), this.sessionManager.getSessionDir(), onProgress),
+					SessionManager.list(this.sessionManager.getCwd(), this.sessionManager.getSessionDir(), onProgress, {
+						includeContent: true,
+					}),
 				(onProgress) =>
 					this.sessionManager.usesDefaultSessionDir()
-						? SessionManager.listAll(onProgress)
-						: SessionManager.listAll(this.sessionManager.getSessionDir(), onProgress),
+						? SessionManager.listAll(onProgress, { includeContent: true })
+						: SessionManager.listAll(this.sessionManager.getSessionDir(), onProgress, { includeContent: true }),
 				async (sessionPath) => {
 					done();
 					await this.handleResumeSession(sessionPath);

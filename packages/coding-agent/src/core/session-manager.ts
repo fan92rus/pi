@@ -8,13 +8,15 @@ import {
 	existsSync,
 	mkdirSync,
 	openSync,
+	readFileSync,
 	readdirSync,
 	readSync,
+	renameSync,
 	statSync,
 	writeFileSync,
 } from "fs";
 import { readdir, stat } from "fs/promises";
-import { join, resolve } from "path";
+import { basename, join, resolve } from "path";
 import { createInterface } from "readline";
 import { StringDecoder } from "string_decoder";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
@@ -28,6 +30,124 @@ import {
 } from "./messages.ts";
 
 export const CURRENT_SESSION_VERSION = 3;
+
+/** Sidecar index of session metadata, one per session directory.
+ *
+ * Listing sessions reads this index and validates each entry against the
+ * file's mtime/size, so only changed or new session files are fully read.
+ * This keeps `list`/`listAll` fast even with hundreds of large session files.
+ */
+export const SESSION_INDEX_VERSION = 1;
+export const SESSION_INDEX_FILENAME = ".index.json";
+
+interface SessionIndexEntry {
+	id: string;
+	cwd: string;
+	name?: string;
+	parentSessionPath?: string;
+	created: string;
+	modified: string;
+	messageCount: number;
+	firstMessage: string;
+	mtimeMs: number;
+	size: number;
+}
+
+interface SessionIndexFile {
+	version: number;
+	sessions: Record<string, SessionIndexEntry>;
+}
+
+function sessionIndexPath(dir: string): string {
+	return join(normalizePath(dir), SESSION_INDEX_FILENAME);
+}
+
+/** Reads the session index for a directory. Returns null when absent or corrupt. */
+function loadSessionIndex(dir: string): SessionIndexFile | null {
+	try {
+		const raw = readFileSync(sessionIndexPath(dir), "utf8");
+		const parsed = JSON.parse(raw) as SessionIndexFile;
+		if (parsed?.version !== SESSION_INDEX_VERSION || !parsed.sessions || typeof parsed.sessions !== "object") {
+			return null;
+		}
+		return parsed;
+	} catch {
+		return null;
+	}
+}
+
+/** Atomically writes the session index (temp file + rename) so concurrent
+ * pi processes (e.g. subagents) never observe a partially written index.
+ * Failure is non-fatal: the index is a cache and is rebuilt lazily. */
+function saveSessionIndex(dir: string, index: SessionIndexFile): void {
+	try {
+		const target = sessionIndexPath(dir);
+		const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
+		writeFileSync(tmp, JSON.stringify(index));
+		try {
+			renameSync(tmp, target);
+		} catch {
+			// Cross-process rename races: keep the temp file, it still helps next read.
+		}
+	} catch {
+		// Ignore: index is best-effort.
+	}
+}
+
+function sessionInfoFromIndexEntry(filePath: string, entry: SessionIndexEntry): SessionInfo {
+	return {
+		path: filePath,
+		id: entry.id,
+		cwd: entry.cwd,
+		name: entry.name,
+		parentSessionPath: entry.parentSessionPath,
+		created: new Date(entry.created),
+		modified: new Date(entry.modified),
+		messageCount: entry.messageCount,
+		firstMessage: entry.firstMessage,
+		allMessagesText: "",
+	};
+}
+
+function sessionIndexEntryFromInfo(info: SessionInfo, mtimeMs: number, size: number): SessionIndexEntry {
+	return {
+		id: info.id,
+		cwd: info.cwd,
+		name: info.name,
+		parentSessionPath: info.parentSessionPath,
+		created: info.created.toISOString(),
+		modified: info.modified.toISOString(),
+		messageCount: info.messageCount,
+		firstMessage: info.firstMessage,
+		mtimeMs,
+		size,
+	};
+}
+
+/** Builds a SessionInfo from the session file header alone (fast path).
+ * Used when a file is new or changed and only id/cwd/created are needed;
+ * messageCount/firstMessage are left at zero until a full read happens. */
+function sessionInfoFromHeader(
+	filePath: string,
+	stats: { mtime: Date; mtimeMs: number; size: number },
+): SessionInfo | null {
+	const header = readSessionHeaderForDiscovery(filePath);
+	if (!header) return null;
+	const created = Number.isNaN(new Date(header.timestamp).getTime())
+		? stats.mtime
+		: new Date(header.timestamp);
+	return {
+		path: filePath,
+		id: header.id,
+		cwd: typeof header.cwd === "string" ? header.cwd : "",
+		parentSessionPath: header.parentSession,
+		created,
+		modified: stats.mtime,
+		messageCount: 0,
+		firstMessage: "",
+		allMessagesText: "",
+	};
+}
 
 export interface SessionHeader {
 	type: "session";
@@ -766,6 +886,13 @@ async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
 
 export type SessionListProgress = (loaded: number, total: number) => void;
 
+export interface SessionListOptions {
+	/** Include full message text (allMessagesText) for content search.
+	 * Defaults to false: sessions are served from the sidecar index when
+	 * their file mtime/size match, avoiding full reads of every session. */
+	includeContent?: boolean;
+}
+
 const MAX_CONCURRENT_SESSION_INFO_LOADS = 10;
 
 async function buildSessionInfosWithConcurrency(
@@ -811,6 +938,7 @@ async function buildSessionInfosWithConcurrency(
 async function listSessionsFromDir(
 	dir: string,
 	onProgress?: SessionListProgress,
+	options: SessionListOptions = {},
 	progressOffset = 0,
 	progressTotal?: number,
 ): Promise<SessionInfo[]> {
@@ -824,16 +952,87 @@ async function listSessionsFromDir(
 		const files = dirEntries.filter((f) => f.endsWith(".jsonl")).map((f) => join(dir, f));
 		const total = progressTotal ?? files.length;
 
+		if (options.includeContent) {
+			// Full path: read every file (needed for content search). Also refresh
+			// the sidecar index so later fast listings return accurate metadata.
+			let loaded = 0;
+			const results = await buildSessionInfosWithConcurrency(files, () => {
+				loaded++;
+				onProgress?.(progressOffset + loaded, total);
+			});
+			const index = loadSessionIndex(dir) ?? { version: SESSION_INDEX_VERSION, sessions: {} };
+			let indexDirty = false;
+			for (const info of results) {
+				if (!info) continue;
+				sessions.push(info);
+				const filename = basename(info.path);
+				try {
+					const stats = statSync(info.path);
+					index.sessions[filename] = sessionIndexEntryFromInfo(info, stats.mtimeMs, stats.size);
+					indexDirty = true;
+				} catch {
+					// File vanished; ignore.
+				}
+			}
+			if (indexDirty) saveSessionIndex(dir, index);
+			return sessions;
+		}
+
+		// Fast path: serve unchanged sessions from the sidecar index. Only files
+		// whose mtime/size changed (or missing from the index) are fully read.
+		const index = loadSessionIndex(dir) ?? { version: SESSION_INDEX_VERSION, sessions: {} };
+		let indexDirty = false;
 		let loaded = 0;
-		const results = await buildSessionInfosWithConcurrency(files, () => {
+		const knownFiles = new Set<string>();
+
+		for (const file of files) {
+			const filename = basename(file);
+			knownFiles.add(filename);
+			let stats: ReturnType<typeof statSync>;
+			try {
+				stats = statSync(file);
+			} catch {
+				// File vanished between readdir and stat (concurrent delete).
+				loaded++;
+				onProgress?.(progressOffset + loaded, total);
+				continue;
+			}
+			const cached = index.sessions[filename];
+			if (cached && cached.mtimeMs === stats.mtimeMs && cached.size === stats.size) {
+				sessions.push(sessionInfoFromIndexEntry(file, cached));
+				loaded++;
+				onProgress?.(progressOffset + loaded, total);
+				continue;
+			}
+
+			// New or changed file: fast header read first, full read only as fallback.
+			const headerInfo = sessionInfoFromHeader(file, stats);
+			if (headerInfo) {
+				sessions.push(headerInfo);
+				index.sessions[filename] = sessionIndexEntryFromInfo(headerInfo, stats.mtimeMs, stats.size);
+				indexDirty = true;
+			} else {
+				const info = await buildSessionInfo(file);
+				if (info) {
+					sessions.push(info);
+					index.sessions[filename] = sessionIndexEntryFromInfo(info, stats.mtimeMs, stats.size);
+					indexDirty = true;
+				}
+			}
 			loaded++;
 			onProgress?.(progressOffset + loaded, total);
-		});
-		for (const info of results) {
-			if (info) {
-				sessions.push(info);
+		}
+
+		// Drop index entries whose session files no longer exist.
+		for (const filename of Object.keys(index.sessions)) {
+			if (!knownFiles.has(filename)) {
+				delete index.sessions[filename];
+				indexDirty = true;
 			}
 		}
+
+		if (indexDirty) saveSessionIndex(dir, index);
+		return sessions;
 	} catch {
 		// Return empty list on error
 	}
@@ -1635,11 +1834,16 @@ export class SessionManager {
 	 * @param sessionDir Optional session directory. If omitted, uses default (~/.pi/agent/sessions/<encoded-cwd>/).
 	 * @param onProgress Optional callback for progress updates (loaded, total)
 	 */
-	static async list(cwd: string, sessionDir?: string, onProgress?: SessionListProgress): Promise<SessionInfo[]> {
+	static async list(
+		cwd: string,
+		sessionDir?: string,
+		onProgress?: SessionListProgress,
+		options?: SessionListOptions,
+	): Promise<SessionInfo[]> {
 		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
 		const filterCwd = sessionDir !== undefined && dir !== getDefaultSessionDirPath(cwd);
 		const resolvedCwd = resolvePath(cwd);
-		const sessions = (await listSessionsFromDir(dir, onProgress)).filter(
+		const sessions = (await listSessionsFromDir(dir, onProgress, options)).filter(
 			(session) => !filterCwd || sessionCwdMatches(session.cwd, resolvedCwd),
 		);
 		sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
@@ -1650,17 +1854,31 @@ export class SessionManager {
 	 * List all sessions across all project directories.
 	 * @param onProgress Optional callback for progress updates (loaded, total)
 	 */
-	static async listAll(onProgress?: SessionListProgress): Promise<SessionInfo[]>;
-	static async listAll(sessionDir?: string, onProgress?: SessionListProgress): Promise<SessionInfo[]>;
+	static async listAll(
+		onProgress?: SessionListProgress,
+		options?: SessionListOptions,
+	): Promise<SessionInfo[]>;
+	static async listAll(
+		sessionDir?: string,
+		onProgress?: SessionListProgress,
+		options?: SessionListOptions,
+	): Promise<SessionInfo[]>;
 	static async listAll(
 		sessionDirOrOnProgress?: string | SessionListProgress,
-		onProgress?: SessionListProgress,
+		onProgressOrOptions?: SessionListProgress | SessionListOptions,
+		maybeOptions?: SessionListOptions,
 	): Promise<SessionInfo[]> {
 		const customSessionDir =
 			typeof sessionDirOrOnProgress === "string" ? normalizePath(sessionDirOrOnProgress) : undefined;
-		const progress = typeof sessionDirOrOnProgress === "function" ? sessionDirOrOnProgress : onProgress;
+		const progress =
+			typeof sessionDirOrOnProgress === "function" ? sessionDirOrOnProgress
+			: typeof onProgressOrOptions === "function" ? onProgressOrOptions
+			: undefined;
+		const options =
+			typeof onProgressOrOptions === "object" && onProgressOrOptions !== null ? onProgressOrOptions
+			: maybeOptions ?? {};
 		if (customSessionDir) {
-			const sessions = await listSessionsFromDir(customSessionDir, progress);
+			const sessions = await listSessionsFromDir(customSessionDir, progress, options);
 			sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
 			return sessions;
 		}
@@ -1673,6 +1891,16 @@ export class SessionManager {
 			}
 			const entries = await readdir(sessionsDir, { withFileTypes: true });
 			const dirs = entries.filter((e) => e.isDirectory()).map((e) => join(sessionsDir, e.name));
+
+			if (!options.includeContent) {
+				// Fast path: per-directory sidecar index with mtime validation.
+				const sessions: SessionInfo[] = [];
+				for (const dir of dirs) {
+					sessions.push(...(await listSessionsFromDir(dir, progress, options)));
+				}
+				sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
+				return sessions;
+			}
 
 			// Count total files first for accurate progress
 			let totalFiles = 0;
