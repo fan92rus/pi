@@ -90,6 +90,9 @@ jobs:
         # The patch is bumped from the CURRENT package version, and the
         # livecraft pre-release number is incremented until the version
         # is not yet published, so CI never collides with manual runs.
+        # The version is written to package.json AND the lockfiles so npm ci
+        # on the next run stays in sync (npm ci fails when package.json and
+        # package-lock.json disagree).
         run: |
           node -e "
             const fs = require('fs');
@@ -97,8 +100,7 @@ jobs:
             const j = JSON.parse(fs.readFileSync(p, 'utf8'));
             const base = j.version.split('-')[0]; // e.g. 0.83.0
             const [major, minor, patch] = base.split('.').map(Number);
-            let next = major + '.' + minor + '.' + (patch + 1) + '-livecraft.0';
-            j.version = next;
+            j.version = major + '.' + minor + '.' + (patch + 1) + '-livecraft.0';
             fs.writeFileSync(p, JSON.stringify(j, null, '\t') + '\n');
             console.log('bumped to', j.version);
           "
@@ -108,14 +110,27 @@ jobs:
             const fs = require('fs');
             const p = 'packages/coding-agent/package.json';
             const j = JSON.parse(fs.readFileSync(p, 'utf8'));
-            let v = j.version;
             for (let n = 0; ; n++) {
-              const candidate = v.split('-')[0] + '-livecraft.' + n;
+              const candidate = j.version.split('-')[0] + '-livecraft.' + n;
               try { execSync('npm view @fan92rus/pi-coding-agent@' + candidate + ' version', { stdio: 'pipe' }); }
               catch { j.version = candidate; fs.writeFileSync(p, JSON.stringify(j, null, '\t') + '\n'); console.log('final', j.version); break; }
             }
+            // Keep the lockfiles in sync with the new package version so the
+            // next npm ci in this workflow does not fail.
+            const lockPath = 'package-lock.json';
+            const lock = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+            if (lock.packages && lock.packages['packages/coding-agent']) {
+              lock.packages['packages/coding-agent'].version = j.version;
+              fs.writeFileSync(lockPath, JSON.stringify(lock, null, '\t') + '\n');
+            }
+            const swPath = 'packages/coding-agent/npm-shrinkwrap.json';
+            const sw = JSON.parse(fs.readFileSync(swPath, 'utf8'));
+            if (sw.packages && sw.packages['']) {
+              sw.packages[''].version = j.version;
+              fs.writeFileSync(swPath, JSON.stringify(sw, null, '\t') + '\n');
+            }
           "
-          git add packages/coding-agent/package.json
+          git add packages/coding-agent/package.json package-lock.json packages/coding-agent/npm-shrinkwrap.json
           git -c user.name="livecraft-bot" -c user.email="livecraft-bot@users.noreply.github.com" \
             commit --no-verify -m "chore: bump to $(node -p "require('./packages/coding-agent/package.json').version")" || true
 
