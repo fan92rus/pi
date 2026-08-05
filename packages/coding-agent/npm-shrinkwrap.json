@@ -6,7 +6,7 @@
 	"packages": {
 		"": {
 			"name": "@fan92rus/pi-coding-agent",
-			"version": "0.83.1-livecraft.1",
+			"version": "0.83.1-livecraft.4",
 			"license": "MIT",
 			"dependencies": {
 				"@earendil-works/pi-agent-core": "^0.83.0",
