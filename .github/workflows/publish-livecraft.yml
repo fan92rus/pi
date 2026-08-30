@@ -73,15 +73,13 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build dependencies of coding-agent
-        # Only the packages coding-agent imports at runtime: tui, ai, agent.
-        run: |
-          npm run build -w @earendil-works/pi-tui
-          npm run build -w @earendil-works/pi-ai
-          npm run build -w @earendil-works/pi-agent-core
-
-      - name: Build coding-agent
-        run: npm run build -w @fan92rus/pi-coding-agent
+      - name: Build (all workspaces in dependency order)
+        # The root build script walks every workspace the coding-agent depends
+        # on at build time (tui -> telemetry -> ai -> agent -> sqlite-node ->
+        # protocol -> client -> server -> coding-agent). A hardcoded
+        # tui/ai/agent list fails once upstream adds new sibling packages
+        # (e.g. pi-telemetry in v0.84.x).
+        run: npm run build
 
       - name: Bump prerelease version
         # Bump via node directly: npm version in a workspace triggers a
