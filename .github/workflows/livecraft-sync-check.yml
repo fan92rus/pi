@@ -1,0 +1,51 @@
+name: Livecraft Sync Check
+
+# GitHub does not run `schedule` cron jobs in forked repositories, so the
+# official nightly publish of the upstream repo never fires here. Instead we
+# piggyback on fork syncs: every push to `main` (which is how this fork
+# tracks upstream) re-checks whether the livecraft branch is behind the
+# latest upstream release tag, and dispatches publish-livecraft when it is.
+# Can also be triggered manually with workflow_dispatch.
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write # needed to dispatch the sibling publish-livecraft workflow
+
+concurrency:
+  group: livecraft-sync-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout livecraft
+        uses: actions/checkout@v4
+        with:
+          ref: livecraft
+          fetch-depth: 0
+
+      - name: Dispatch publish if livecraft is behind upstream
+        run: |
+          git remote add upstream https://github.com/earendil-works/pi.git
+          git fetch upstream --tags
+          LATEST_TAG=$(git tag --list 'v*' --sort=-v:refname | head -1)
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No upstream release tags found – nothing to do."
+            exit 0
+          fi
+          echo "Latest upstream release tag: $LATEST_TAG"
+          if git merge-base --is-ancestor "$LATEST_TAG" HEAD; then
+            echo "Livecraft already contains $LATEST_TAG – nothing to publish."
+          else
+            echo "Livecraft is behind $LATEST_TAG – dispatching publish-livecraft."
+            gh workflow run publish-livecraft.yml --repo fan92rus/pi --ref livecraft
+            echo "Dispatched."
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
