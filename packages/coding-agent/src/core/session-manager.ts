@@ -20,7 +20,7 @@ import { readdir, stat } from "fs/promises";
 import { basename, join, resolve } from "path";
 import { createInterface } from "readline";
 import { StringDecoder } from "string_decoder";
-import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
+import { APP_NAME, getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
 import {
 	type BashExecutionMessage,
@@ -643,11 +643,11 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 	if (!existsSync(resolvedFilePath)) return [];
 
 	const entries: FileEntry[] = [];
+	let pending = "";
 	const fd = openSync(resolvedFilePath, "r");
 	try {
 		const decoder = new StringDecoder("utf8");
 		const buffer = Buffer.allocUnsafe(SESSION_READ_BUFFER_SIZE);
-		let pending = "";
 
 		while (true) {
 			const bytesRead = readSync(fd, buffer, 0, buffer.length, null);
@@ -672,13 +672,14 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 		closeSync(fd);
 	}
 
-	// Validate session header
+	// Validate session header before repairing the file.
 	if (entries.length === 0) return entries;
 	const header = entries[0];
 	if (header.type !== "session" || typeof (header as { id?: unknown }).id !== "string") {
 		return [];
 	}
 
+	if (pending) appendFileSync(resolvedFilePath, "\n");
 	return entries;
 }
 
@@ -1109,7 +1110,7 @@ export class SessionManager {
 			if (this.fileEntries.length === 0) {
 				const explicitPath = this.sessionFile;
 				if (statSync(explicitPath).size > 0) {
-					throw new Error(`Session file is not a valid pi session: ${explicitPath}`);
+					throw new Error(`Session file is not a valid ${APP_NAME} session: ${explicitPath}`);
 				}
 				this.newSession();
 				this.sessionFile = explicitPath;
@@ -1595,13 +1596,14 @@ export class SessionManager {
 		if (branchFromId !== null && !this.byId.has(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
+		const fromId = this.leafId ?? "root";
 		this.leafId = branchFromId;
 		const entry: BranchSummaryEntry = {
 			type: "branch_summary",
 			id: generateId(this.byId),
 			parentId: branchFromId,
 			timestamp: new Date().toISOString(),
-			fromId: branchFromId ?? "root",
+			fromId,
 			summary,
 			details,
 			usage,
@@ -1898,7 +1900,9 @@ export class SessionManager {
 				return [];
 			}
 			const entries = await readdir(sessionsDir, { withFileTypes: true });
-			const dirs = entries.filter((e) => e.isDirectory()).map((e) => join(sessionsDir, e.name));
+			const dirs = entries
+				.filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
+				.map((entry) => join(sessionsDir, entry.name));
 
 			if (!options.includeContent) {
 				// Fast path: per-directory sidecar index with mtime validation.
