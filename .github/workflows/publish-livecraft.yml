@@ -133,9 +133,10 @@ jobs:
             sw.version = j.version;
             fs.writeFileSync(swPath, JSON.stringify(sw, null, '\t') + '\n');
           "
+          # bump-коммит НЕ пушится (см. шаг Restore base version ниже) —
+          # версия остаётся на базе в истории ветки; собранная prerelease
+          # живёт только в npm.
           git add packages/coding-agent/package.json package-lock.json packages/coding-agent/npm-shrinkwrap.json
-          git -c user.name="livecraft-bot" -c user.email="livecraft-bot@users.noreply.github.com" \
-            commit --no-verify -m "chore: bump to $(node -p "require('./packages/coding-agent/package.json').version")" || true
 
       - name: Publish to npm
         working-directory: packages/coding-agent
@@ -153,5 +154,19 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+      - name: Restore base version
+        # Ветка livecraft должна оставаться на БАЗОВОЙ версии (0.84.4): evals
+        # пингует @fan92rus/pi-coding-agent@^0.84.4, а закоммиченный bump
+        # (0.84.5-livecraft.N — prerelease) выпадает из этого диапазона, и
+        # следующий `npm ci` падает с ETARGET. Сбрасываем bump-изменения на
+        # рабочем дереве — пуш становится no-op, ветка не двигается.
+        run: |
+          # checkout HEAD -- восстанавливает И индекс, и рабочее дерево из HEAD
+          # (bump-шаг выше сделал git add, поэтому простой checkout -- вернул бы
+          # проиндексированную bump-версию, а не базовую).
+          git checkout HEAD -- packages/coding-agent/package.json package-lock.json packages/coding-agent/npm-shrinkwrap.json || true
+          git status --porcelain || true
+          git push origin livecraft || true
+
       - name: Push bump commit
-        run: git push origin livecraft || true
+        run: echo "(base version preserved on branch; publish already done)"
