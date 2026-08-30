@@ -143,5 +143,15 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+      - name: Point latest at this version
+        # The npm package page, bare 'npm view', and 'npm i -g' without an
+        # explicit tag all resolve the 'latest' dist-tag. Keep it in sync with
+        # every livecraft publish so the package never shows a stale version
+        # (this was frozen on 0.83.1-livecraft.4 while livecraft moved on).
+        working-directory: packages/coding-agent
+        run: npm dist-tag add @fan92rus/pi-coding-agent@$(node -p "require('./package.json').version") latest
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
       - name: Push bump commit
         run: git push origin livecraft || true
