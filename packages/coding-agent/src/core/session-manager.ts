@@ -1,5 +1,13 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { type ImageContent, type Message, type TextContent, type Usage, uuidv7 } from "@earendil-works/pi-ai";
+import {
+	getCurrentSystemMessage,
+	type ImageContent,
+	type Message,
+	type SystemMessage,
+	type TextContent,
+	type Usage,
+	uuidv7,
+} from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
 import {
 	appendFileSync,
@@ -9,11 +17,9 @@ import {
 	mkdirSync,
 	openSync,
 	readdirSync,
-	readFileSync,
 	readSync,
-	renameSync,
+	type Stats,
 	statSync,
-	unlinkSync,
 	writeFileSync,
 } from "fs";
 import { readdir, stat } from "fs/promises";
@@ -29,132 +35,7 @@ import {
 	createCompactionSummaryMessage,
 	createCustomMessage,
 } from "./messages.ts";
-
 export const CURRENT_SESSION_VERSION = 3;
-
-/** Sidecar index of session metadata, one per session directory.
- *
- * Listing sessions reads this index and validates each entry against the
- * file's mtime/size, so only changed or new session files are fully read.
- * This keeps `list`/`listAll` fast even with hundreds of large session files.
- */
-export const SESSION_INDEX_VERSION = 1;
-export const SESSION_INDEX_FILENAME = ".index.json";
-
-interface SessionIndexEntry {
-	id: string;
-	cwd: string;
-	name?: string;
-	parentSessionPath?: string;
-	created: string;
-	modified: string;
-	messageCount: number;
-	firstMessage: string;
-	mtimeMs: number;
-	size: number;
-}
-
-interface SessionIndexFile {
-	version: number;
-	sessions: Record<string, SessionIndexEntry>;
-}
-
-function sessionIndexPath(dir: string): string {
-	return join(normalizePath(dir), SESSION_INDEX_FILENAME);
-}
-
-/** Reads the session index for a directory. Returns null when absent or corrupt. */
-function loadSessionIndex(dir: string): SessionIndexFile | null {
-	try {
-		const raw = readFileSync(sessionIndexPath(dir), "utf8");
-		const parsed = JSON.parse(raw) as SessionIndexFile;
-		if (parsed?.version !== SESSION_INDEX_VERSION || !parsed.sessions || typeof parsed.sessions !== "object") {
-			return null;
-		}
-		return parsed;
-	} catch {
-		return null;
-	}
-}
-
-/** Atomically writes the session index (temp file + rename) so concurrent
- * pi processes (e.g. subagents) never observe a partially written index.
- * Failure is non-fatal: the index is a cache and is rebuilt lazily. */
-function saveSessionIndex(dir: string, index: SessionIndexFile): void {
-	try {
-		const target = sessionIndexPath(dir);
-		const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
-		writeFileSync(tmp, JSON.stringify(index));
-		try {
-			renameSync(tmp, target);
-		} catch {
-			// Cross-process rename race: another process already wrote the
-			// target. The temp file can never be read back (loadSessionIndex
-			// only reads the target), so remove it instead of leaving an
-			// orphaned .tmp file behind.
-			try {
-				unlinkSync(tmp);
-			} catch {
-				// Best-effort cleanup; ignore.
-			}
-		}
-	} catch {
-		// Ignore: index is best-effort.
-	}
-}
-
-function sessionInfoFromIndexEntry(filePath: string, entry: SessionIndexEntry): SessionInfo {
-	return {
-		path: filePath,
-		id: entry.id,
-		cwd: entry.cwd,
-		name: entry.name,
-		parentSessionPath: entry.parentSessionPath,
-		created: new Date(entry.created),
-		modified: new Date(entry.modified),
-		messageCount: entry.messageCount,
-		firstMessage: entry.firstMessage,
-		allMessagesText: "",
-	};
-}
-
-function sessionIndexEntryFromInfo(info: SessionInfo, mtimeMs: number, size: number): SessionIndexEntry {
-	return {
-		id: info.id,
-		cwd: info.cwd,
-		name: info.name,
-		parentSessionPath: info.parentSessionPath,
-		created: info.created.toISOString(),
-		modified: info.modified.toISOString(),
-		messageCount: info.messageCount,
-		firstMessage: info.firstMessage,
-		mtimeMs,
-		size,
-	};
-}
-
-/** Builds a SessionInfo from the session file header alone (fast path).
- * Used when a file is new or changed and only id/cwd/created are needed;
- * messageCount/firstMessage are left at zero until a full read happens. */
-function sessionInfoFromHeader(
-	filePath: string,
-	stats: { mtime: Date; mtimeMs: number; size: number },
-): SessionInfo | null {
-	const header = readSessionHeaderForDiscovery(filePath);
-	if (!header) return null;
-	const created = Number.isNaN(new Date(header.timestamp).getTime()) ? stats.mtime : new Date(header.timestamp);
-	return {
-		path: filePath,
-		id: header.id,
-		cwd: typeof header.cwd === "string" ? header.cwd : "",
-		parentSessionPath: header.parentSession,
-		created,
-		modified: stats.mtime,
-		messageCount: 0,
-		firstMessage: "",
-		allMessagesText: "",
-	};
-}
 
 export interface SessionHeader {
 	type: "session";
@@ -193,6 +74,17 @@ export interface ModelChangeEntry extends SessionEntryBase {
 	modelId: string;
 }
 
+export interface UsageEntry extends SessionEntryBase {
+	type: "usage";
+	/** Arbitrary usage category, such as "cache_warm". */
+	kind: string;
+	provider: string;
+	model: string;
+	usage: Usage;
+	/** Optional human-readable qualifier for usage notices. */
+	note?: string;
+}
+
 export interface CompactionEntry<T = unknown> extends SessionEntryBase {
 	type: "compaction";
 	summary: string;
@@ -204,6 +96,8 @@ export interface CompactionEntry<T = unknown> extends SessionEntryBase {
 	usage?: Usage;
 	/** True if generated by an extension, undefined/false if pi-generated (backward compatible) */
 	fromHook?: boolean;
+	/** Complete prompt and tool state at this compaction boundary. */
+	systemMessage?: SystemMessage;
 }
 
 export interface BranchSummaryEntry<T = unknown> extends SessionEntryBase {
@@ -272,6 +166,7 @@ export type SessionEntry =
 	| SessionMessageEntry
 	| ThinkingLevelChangeEntry
 	| ModelChangeEntry
+	| UsageEntry
 	| CompactionEntry
 	| BranchSummaryEntry
 	| CustomEntry
@@ -512,6 +407,7 @@ export function sessionEntryToContextMessages(entry: SessionEntry): AgentMessage
 		const message = entry.message;
 		// Session files are parsed without validation; old versions, forks, or
 		// hand-edited files can contain messages with null/missing content.
+		if (message.role === "system" && message.content == null) return [{ ...message, content: "" }];
 		if (
 			(message.role === "user" || message.role === "assistant" || message.role === "toolResult") &&
 			message.content == null
@@ -529,7 +425,8 @@ export function sessionEntryToContextMessages(entry: SessionEntry): AgentMessage
 		return [createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp)];
 	}
 	if (entry.type === "compaction") {
-		return [createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp)];
+		const summary = createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp);
+		return entry.systemMessage ? [entry.systemMessage, summary] : [summary];
 	}
 	return [];
 }
@@ -572,7 +469,7 @@ export function buildContextEntries(
 		if (entry.id === compaction.firstKeptEntryId) {
 			foundFirstKept = true;
 		}
-		if (foundFirstKept) {
+		if (foundFirstKept && !(entry.type === "message" && entry.message.role === "system")) {
 			contextEntries.push(entry);
 		}
 	}
@@ -765,18 +662,16 @@ export function findMostRecentSession(sessionDir: string, cwd?: string): string 
 	const resolvedCwd = cwd ? resolvePath(cwd) : undefined;
 	try {
 		const files = readdirSync(resolvedSessionDir)
-			.filter((f) => f.endsWith(".jsonl"))
-			.map((f) => join(resolvedSessionDir, f))
-			.map((path) => ({ path, header: readSessionHeaderForDiscovery(path) }))
-			.filter(
-				(file): file is { path: string; header: SessionHeader } =>
-					file.header !== null &&
-					(!resolvedCwd || sessionCwdMatches(getSessionHeaderCwd(file.header), resolvedCwd)),
-			)
-			.map(({ path }) => ({ path, mtime: statSync(path).mtime }))
-			.sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
+			.filter((file) => file.endsWith(".jsonl"))
+			.map((file) => join(resolvedSessionDir, file))
+			.map((path) => ({ path, mtime: statSync(path).mtimeMs }))
+			.sort((a, b) => b.mtime - a.mtime);
 
-		return files[0]?.path || null;
+		for (const { path } of files) {
+			const header = readSessionHeaderForDiscovery(path);
+			if (header && (!resolvedCwd || sessionCwdMatches(getSessionHeaderCwd(header), resolvedCwd))) return path;
+		}
+		return null;
 	} catch {
 		// Directory access and stat races make recent-session discovery unavailable.
 		return null;
@@ -812,10 +707,13 @@ function getMessageActivityTime(entry: SessionMessageEntry): number | undefined 
 	return Number.isNaN(t) ? undefined : t;
 }
 
-async function buildSessionInfo(filePath: string, options?: { includeContent?: boolean }): Promise<SessionInfo | null> {
-	const includeContent = options?.includeContent ?? true;
+async function buildSessionInfo(
+	filePath: string,
+	signal?: AbortSignal,
+	fileStats?: Stats,
+): Promise<SessionInfo | null> {
 	try {
-		const stats = await stat(filePath);
+		const stats = fileStats ?? (await stat(filePath));
 		let header: SessionHeader | null = null;
 		let messageCount = 0;
 		let firstMessage = "";
@@ -824,7 +722,7 @@ async function buildSessionInfo(filePath: string, options?: { includeContent?: b
 		let lastActivityTime: number | undefined;
 
 		const rl = createInterface({
-			input: createReadStream(filePath, { encoding: "utf8" }),
+			input: createReadStream(filePath, { encoding: "utf8", signal }),
 			crlfDelay: Infinity,
 		});
 
@@ -858,9 +756,7 @@ async function buildSessionInfo(filePath: string, options?: { includeContent?: b
 			const textContent = extractTextContent(message);
 			if (!textContent) continue;
 
-			if (includeContent) {
-				allMessages.push(textContent);
-			}
+			allMessages.push(textContent);
 			if (!firstMessage && message.role === "user") {
 				firstMessage = textContent;
 			}
@@ -888,165 +784,104 @@ async function buildSessionInfo(filePath: string, options?: { includeContent?: b
 			modified,
 			messageCount,
 			firstMessage: firstMessage || "(no messages)",
-			allMessagesText: includeContent ? allMessages.join(" ") : "",
+			allMessagesText: allMessages.join(" "),
 		};
 	} catch {
+		signal?.throwIfAborted();
 		return null;
 	}
 }
 
-export type SessionListProgress = (loaded: number, total: number) => void;
-
-export interface SessionListOptions {
-	/** Include full message text (allMessagesText) for content search.
-	 * Defaults to false: sessions are served from the sidecar index when
-	 * their file mtime/size match, avoiding full reads of every session. */
-	includeContent?: boolean;
-}
+export type SessionListProgress = (
+	loaded: number,
+	total: number,
+	/** Sessions loaded so far, sorted by activity. Present on periodic updates. */
+	partialSessions?: readonly SessionInfo[],
+) => void;
 
 const MAX_CONCURRENT_SESSION_INFO_LOADS = 10;
+const MAX_CONCURRENT_SESSION_DISCOVERY_LOADS = 64;
+const CURRENT_SESSION_LIST_PUBLISH_INTERVAL = 10;
+const ALL_SESSION_LIST_PUBLISH_INTERVAL = 100;
 
-async function buildSessionInfosWithConcurrency(
-	files: string[],
-	onLoaded: () => void,
-): Promise<(SessionInfo | null)[]> {
-	const results: (SessionInfo | null)[] = new Array(files.length).fill(null);
-	const inFlight = new Set<Promise<void>>();
+interface SessionFileCandidate {
+	path: string;
+	stats?: Stats;
+}
+
+async function mapWithConcurrency<T, R>(
+	items: T[],
+	limit: number,
+	map: (item: T, index: number) => Promise<R>,
+	signal?: AbortSignal,
+): Promise<R[]> {
+	const results = new Array<R>(items.length);
 	let nextIndex = 0;
-
-	const startNext = (): void => {
-		const index = nextIndex++;
-		const file = files[index];
-		if (!file) return;
-
-		let task: Promise<void>;
-		task = buildSessionInfo(file)
-			.then((info) => {
-				results[index] = info;
-			})
-			.catch(() => {
-				results[index] = null;
-			})
-			.finally(() => {
-				inFlight.delete(task);
-				onLoaded();
-			});
-		inFlight.add(task);
+	const worker = async (): Promise<void> => {
+		while (nextIndex < items.length) {
+			signal?.throwIfAborted();
+			const index = nextIndex++;
+			results[index] = await map(items[index]!, index);
+		}
 	};
-
-	while (nextIndex < files.length || inFlight.size > 0) {
-		while (nextIndex < files.length && inFlight.size < MAX_CONCURRENT_SESSION_INFO_LOADS) {
-			startNext();
-		}
-		if (inFlight.size > 0) {
-			await Promise.race(inFlight);
-		}
-	}
-
+	await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()));
 	return results;
+}
+
+function sortSessionInfos(sessions: SessionInfo[]): SessionInfo[] {
+	return sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
+}
+
+function buildSessionInfosWithConcurrency(
+	files: SessionFileCandidate[],
+	onLoaded: (info: SessionInfo | null, index: number) => void,
+	signal?: AbortSignal,
+): Promise<(SessionInfo | null)[]> {
+	return mapWithConcurrency(
+		files,
+		MAX_CONCURRENT_SESSION_INFO_LOADS,
+		async (file, index) => {
+			const info = await buildSessionInfo(file.path, signal, file.stats);
+			onLoaded(info, index);
+			return info;
+		},
+		signal,
+	);
 }
 
 async function listSessionsFromDir(
 	dir: string,
 	onProgress?: SessionListProgress,
-	options: SessionListOptions = {},
-	progressOffset = 0,
-	progressTotal?: number,
+	signal?: AbortSignal,
 ): Promise<SessionInfo[]> {
-	const sessions: SessionInfo[] = [];
-	if (!existsSync(dir)) {
-		return sessions;
-	}
+	signal?.throwIfAborted();
+	if (!existsSync(dir)) return [];
 
 	try {
 		const dirEntries = await readdir(dir);
-		const files = dirEntries.filter((f) => f.endsWith(".jsonl")).map((f) => join(dir, f));
-		const total = progressTotal ?? files.length;
-
-		if (options.includeContent) {
-			// Full path: read every file (needed for content search). Also refresh
-			// the sidecar index so later fast listings return accurate metadata.
-			let loaded = 0;
-			const results = await buildSessionInfosWithConcurrency(files, () => {
-				loaded++;
-				onProgress?.(progressOffset + loaded, total);
-			});
-			const index = loadSessionIndex(dir) ?? { version: SESSION_INDEX_VERSION, sessions: {} };
-			let indexDirty = false;
-			for (const info of results) {
-				if (!info) continue;
-				sessions.push(info);
-				const filename = basename(info.path);
-				try {
-					const stats = statSync(info.path);
-					index.sessions[filename] = sessionIndexEntryFromInfo(info, stats.mtimeMs, stats.size);
-					indexDirty = true;
-				} catch {
-					// File vanished; ignore.
-				}
-			}
-			if (indexDirty) saveSessionIndex(dir, index);
-			return sessions;
-		}
-
-		// Fast path: serve unchanged sessions from the sidecar index. Only files
-		// whose mtime/size changed (or missing from the index) are fully read.
-		const index = loadSessionIndex(dir) ?? { version: SESSION_INDEX_VERSION, sessions: {} };
-		let indexDirty = false;
+		const files = dirEntries
+			.filter((file) => file.endsWith(".jsonl"))
+			.sort((a, b) => b.localeCompare(a))
+			.map((file) => ({ path: join(dir, file) }));
+		const total = files.length;
+		const partialSessions: SessionInfo[] = [];
 		let loaded = 0;
-		const knownFiles = new Set<string>();
-
-		for (const file of files) {
-			const filename = basename(file);
-			knownFiles.add(filename);
-			let stats: ReturnType<typeof statSync>;
-			try {
-				stats = statSync(file);
-			} catch {
-				// File vanished between readdir and stat (concurrent delete).
+		const results = await buildSessionInfosWithConcurrency(
+			files,
+			(info) => {
 				loaded++;
-				onProgress?.(progressOffset + loaded, total);
-				continue;
-			}
-			const cached = index.sessions[filename];
-			if (cached && cached.mtimeMs === stats.mtimeMs && cached.size === stats.size) {
-				sessions.push(sessionInfoFromIndexEntry(file, cached));
-				loaded++;
-				onProgress?.(progressOffset + loaded, total);
-				continue;
-			}
-
-			// New or changed file: fully read it so the index gets accurate
-			// metadata (modified = last message time, messageCount, name,
-			// firstMessage) instead of degraded header-only values.
-			const info = await buildSessionInfo(file, { includeContent: false });
-			if (info) {
-				sessions.push(info);
-				index.sessions[filename] = sessionIndexEntryFromInfo(info, stats.mtimeMs, stats.size);
-				indexDirty = true;
-			} else {
-				const headerInfo = sessionInfoFromHeader(file, stats);
-				if (headerInfo) sessions.push(headerInfo);
-			}
-			loaded++;
-			onProgress?.(progressOffset + loaded, total);
-		}
-
-		// Drop index entries whose session files no longer exist.
-		for (const filename of Object.keys(index.sessions)) {
-			if (!knownFiles.has(filename)) {
-				delete index.sessions[filename];
-				indexDirty = true;
-			}
-		}
-
-		if (indexDirty) saveSessionIndex(dir, index);
-		return sessions;
+				if (info) partialSessions.push(info);
+				const publishPartial =
+					loaded === 1 || loaded % CURRENT_SESSION_LIST_PUBLISH_INTERVAL === 0 || loaded === files.length;
+				onProgress?.(loaded, total, publishPartial ? sortSessionInfos([...partialSessions]) : undefined);
+			},
+			signal,
+		);
+		return results.filter((info): info is SessionInfo => info !== null);
 	} catch {
-		// Return empty list on error
+		signal?.throwIfAborted();
+		return [];
 	}
-
-	return sessions;
 }
 
 /**
@@ -1314,6 +1149,23 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	/** Append model-attributed usage that does not participate in LLM context. Returns the appended entry. */
+	appendUsage(kind: string, provider: string, model: string, usage: Usage, note?: string): UsageEntry {
+		const entry: UsageEntry = {
+			type: "usage",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			kind,
+			provider,
+			model,
+			usage,
+			...(note ? { note } : {}),
+		};
+		this._appendEntry(entry);
+		return entry;
+	}
+
 	/** Append a compaction summary as child of current leaf, then advance leaf. Returns entry id. */
 	appendCompaction<T = unknown>(
 		summary: string,
@@ -1323,17 +1175,20 @@ export class SessionManager {
 		fromHook?: boolean,
 		usage?: Usage,
 	): string {
+		const timestamp = new Date().toISOString();
+		const systemMessage = getCurrentSystemMessage(this.buildSessionContext().messages);
 		const entry: CompactionEntry<T> = {
 			type: "compaction",
 			id: generateId(this.byId),
 			parentId: this.leafId,
-			timestamp: new Date().toISOString(),
+			timestamp,
 			summary,
 			firstKeptEntryId,
 			tokensBefore,
 			details,
 			usage,
 			fromHook,
+			...(systemMessage ? { systemMessage: { ...systemMessage, timestamp: new Date(timestamp).getTime() } } : {}),
 		};
 		this._appendEntry(entry);
 		return entry.id;
@@ -1869,6 +1724,32 @@ export class SessionManager {
 	}
 
 	/**
+	 * Find an exact session ID without loading transcript bodies.
+	 * @param cwd Working directory (used to compute default session directory)
+	 * @param id Exact session ID
+	 * @param sessionDir Optional session directory. If omitted, uses default (~/.pi/agent/sessions/<encoded-cwd>/).
+	 */
+	static findById(cwd: string, id: string, sessionDir?: string): string | undefined {
+		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
+		const filterCwd = sessionDir !== undefined && dir !== getDefaultSessionDirPath(cwd);
+		const resolvedCwd = resolvePath(cwd);
+
+		try {
+			for (const file of readdirSync(dir)) {
+				if (!file.endsWith(".jsonl")) continue;
+				const path = join(dir, file);
+				const header = readSessionHeaderForDiscovery(path);
+				if (header?.id !== id) continue;
+				if (filterCwd && !sessionCwdMatches(getSessionHeaderCwd(header), resolvedCwd)) continue;
+				return path;
+			}
+		} catch {
+			// Exact session discovery is best-effort, matching list().
+		}
+		return undefined;
+	}
+
+	/**
 	 * List all sessions for a directory.
 	 * @param cwd Working directory (used to compute default session directory)
 	 * @param sessionDir Optional session directory. If omitted, uses default (~/.pi/agent/sessions/<encoded-cwd>/).
@@ -1878,119 +1759,112 @@ export class SessionManager {
 		cwd: string,
 		sessionDir?: string,
 		onProgress?: SessionListProgress,
-		options?: SessionListOptions,
+		signal?: AbortSignal,
 	): Promise<SessionInfo[]> {
 		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
 		const filterCwd = sessionDir !== undefined && dir !== getDefaultSessionDirPath(cwd);
 		const resolvedCwd = resolvePath(cwd);
-		const sessions = (await listSessionsFromDir(dir, onProgress, options)).filter(
-			(session) => !filterCwd || sessionCwdMatches(session.cwd, resolvedCwd),
-		);
-		sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
-		return sessions;
+		const includeSession = (session: SessionInfo) => !filterCwd || sessionCwdMatches(session.cwd, resolvedCwd);
+		const progress: SessionListProgress | undefined = onProgress
+			? (loaded, total, partialSessions) => onProgress(loaded, total, partialSessions?.filter(includeSession))
+			: undefined;
+		const sessions = (await listSessionsFromDir(dir, progress, signal)).filter(includeSession);
+		return sortSessionInfos(sessions);
 	}
 
 	/**
 	 * List all sessions across all project directories.
 	 * @param onProgress Optional callback for progress updates (loaded, total)
 	 */
-	static async listAll(onProgress?: SessionListProgress, options?: SessionListOptions): Promise<SessionInfo[]>;
+	static async listAll(onProgress?: SessionListProgress, signal?: AbortSignal): Promise<SessionInfo[]>;
 	static async listAll(
 		sessionDir?: string,
 		onProgress?: SessionListProgress,
-		options?: SessionListOptions,
+		signal?: AbortSignal,
 	): Promise<SessionInfo[]>;
 	static async listAll(
 		sessionDirOrOnProgress?: string | SessionListProgress,
-		onProgressOrOptions?: SessionListProgress | SessionListOptions,
-		maybeOptions?: SessionListOptions,
+		onProgressOrSignal?: SessionListProgress | AbortSignal,
+		signal?: AbortSignal,
 	): Promise<SessionInfo[]> {
 		const customSessionDir =
 			typeof sessionDirOrOnProgress === "string" ? normalizePath(sessionDirOrOnProgress) : undefined;
 		const progress =
 			typeof sessionDirOrOnProgress === "function"
 				? sessionDirOrOnProgress
-				: typeof onProgressOrOptions === "function"
-					? onProgressOrOptions
+				: typeof onProgressOrSignal === "function"
+					? onProgressOrSignal
 					: undefined;
-		const options =
-			typeof onProgressOrOptions === "object" && onProgressOrOptions !== null
-				? onProgressOrOptions
-				: (maybeOptions ?? {});
+		const abortSignal =
+			typeof sessionDirOrOnProgress === "string" || typeof onProgressOrSignal === "function"
+				? signal
+				: (onProgressOrSignal ?? signal);
+		abortSignal?.throwIfAborted();
 		if (customSessionDir) {
-			const sessions = await listSessionsFromDir(customSessionDir, progress, options);
-			sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
-			return sessions;
+			return sortSessionInfos(await listSessionsFromDir(customSessionDir, progress, abortSignal));
 		}
 
 		const sessionsDir = getSessionsDir();
 
 		try {
-			if (!existsSync(sessionsDir)) {
-				return [];
-			}
+			if (!existsSync(sessionsDir)) return [];
 			const entries = await readdir(sessionsDir, { withFileTypes: true });
 			const dirs = entries
 				.filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
 				.map((entry) => join(sessionsDir, entry.name));
 
-			if (!options.includeContent) {
-				// Fast path: per-directory sidecar index with mtime validation.
-				// Count total session files first so progress is reported globally
-				// across all project directories, not per-directory.
-				const sessions: SessionInfo[] = [];
-				const dirFileCounts: number[] = [];
-				let totalFiles = 0;
-				for (const dir of dirs) {
+			const dirFiles = await mapWithConcurrency(
+				dirs,
+				MAX_CONCURRENT_SESSION_DISCOVERY_LOADS,
+				async (dir) => {
 					try {
-						const count = (await readdir(dir)).filter((f) => f.endsWith(".jsonl")).length;
-						dirFileCounts.push(count);
-						totalFiles += count;
+						return (await readdir(dir)).filter((file) => file.endsWith(".jsonl")).map((file) => join(dir, file));
 					} catch {
-						dirFileCounts.push(0);
+						return [];
 					}
-				}
-				let progressOffset = 0;
-				for (let i = 0; i < dirs.length; i++) {
-					sessions.push(...(await listSessionsFromDir(dirs[i], progress, options, progressOffset, totalFiles)));
-					progressOffset += dirFileCounts[i];
-				}
-				sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
-				return sessions;
-			}
-
-			// Count total files first for accurate progress
-			let totalFiles = 0;
-			const dirFiles: string[][] = [];
-			for (const dir of dirs) {
-				try {
-					const files = (await readdir(dir)).filter((f) => f.endsWith(".jsonl"));
-					dirFiles.push(files.map((f) => join(dir, f)));
-					totalFiles += files.length;
-				} catch {
-					dirFiles.push([]);
-				}
-			}
-
-			// Process all files with progress tracking
-			let loaded = 0;
-			const sessions: SessionInfo[] = [];
+				},
+				abortSignal,
+			);
 			const allFiles = dirFiles.flat();
+			const candidates = await mapWithConcurrency(
+				allFiles,
+				MAX_CONCURRENT_SESSION_DISCOVERY_LOADS,
+				async (path): Promise<SessionFileCandidate> => {
+					try {
+						return { path, stats: await stat(path) };
+					} catch {
+						return { path };
+					}
+				},
+				abortSignal,
+			);
+			candidates.sort(
+				(a, b) =>
+					(b.stats?.mtimeMs ?? Number.NEGATIVE_INFINITY) - (a.stats?.mtimeMs ?? Number.NEGATIVE_INFINITY) ||
+					basename(b.path).localeCompare(basename(a.path)),
+			);
 
-			const results = await buildSessionInfosWithConcurrency(allFiles, () => {
-				loaded++;
-				progress?.(loaded, totalFiles);
-			});
+			const totalFiles = candidates.length;
+			let loaded = 0;
+			let firstCandidateLoaded = false;
+			const partialSessions: SessionInfo[] = [];
+			const results = await buildSessionInfosWithConcurrency(
+				candidates,
+				(info, index) => {
+					loaded++;
+					if (index === 0) firstCandidateLoaded = true;
+					if (info) partialSessions.push(info);
+					const publishPartial =
+						firstCandidateLoaded &&
+						(index === 0 || loaded % ALL_SESSION_LIST_PUBLISH_INTERVAL === 0 || loaded === totalFiles);
+					progress?.(loaded, totalFiles, publishPartial ? sortSessionInfos([...partialSessions]) : undefined);
+				},
+				abortSignal,
+			);
 
-			for (const info of results) {
-				if (info) {
-					sessions.push(info);
-				}
-			}
-
-			sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
-			return sessions;
+			return sortSessionInfos(results.filter((info): info is SessionInfo => info !== null));
 		} catch {
+			abortSignal?.throwIfAborted();
 			return [];
 		}
 	}
